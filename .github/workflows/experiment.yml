@@ -1,0 +1,132 @@
+name: Autoresearch Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: "Short description of this experiment (logged to results.tsv)"
+        required: true
+        default: "baseline"
+      num_shards:
+        description: "Number of training data shards to download"
+        required: false
+        default: "10"
+  push:
+    branches:
+      - "autoresearch/**"
+
+jobs:
+  experiment:
+    # Requires a self-hosted runner with an NVIDIA GPU (H100 tested).
+    # Register one at: Settings > Actions > Runners > New self-hosted runner
+    # and label it 'gpu'.
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Cache training data
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/autoresearch
+          key: autoresearch-data-${{ inputs.num_shards || '10' }}-shards
+          restore-keys: |
+            autoresearch-data-
+
+      - name: Prepare data and tokenizer
+        run: uv run prepare.py --num-shards ${{ inputs.num_shards || '10' }}
+
+      - name: Run experiment
+        run: uv run train.py > run.log 2>&1
+
+      - name: Extract results
+        id: results
+        if: always()
+        run: |
+          val_bpb=$(grep "^val_bpb:" run.log | awk '{print $2}' || echo "")
+          peak_vram_mb=$(grep "^peak_vram_mb:" run.log | awk '{print $2}' || echo "")
+          training_seconds=$(grep "^training_seconds:" run.log | awk '{print $2}' || echo "")
+          num_params_m=$(grep "^num_params_M:" run.log | awk '{print $2}' || echo "")
+
+          if [ -z "$val_bpb" ]; then
+            echo "status=crash" >> $GITHUB_OUTPUT
+            echo "val_bpb=0.000000" >> $GITHUB_OUTPUT
+            echo "memory_gb=0.0" >> $GITHUB_OUTPUT
+          else
+            echo "status=keep" >> $GITHUB_OUTPUT
+            echo "val_bpb=$val_bpb" >> $GITHUB_OUTPUT
+            memory_gb=$(awk "BEGIN {printf \"%.1f\", ${peak_vram_mb:-0} / 1024}")
+            echo "memory_gb=$memory_gb" >> $GITHUB_OUTPUT
+          fi
+
+          echo "training_seconds=${training_seconds:-N/A}" >> $GITHUB_OUTPUT
+          echo "num_params_m=${num_params_m:-N/A}" >> $GITHUB_OUTPUT
+          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Append to results.tsv
+        if: always()
+        run: |
+          if [ ! -f results.tsv ]; then
+            echo -e "commit\tval_bpb\tmemory_gb\tstatus\tdescription" > results.tsv
+          fi
+          desc="${{ inputs.description || github.ref_name }}"
+          echo -e "${{ steps.results.outputs.short_sha }}\t${{ steps.results.outputs.val_bpb }}\t${{ steps.results.outputs.memory_gb }}\t${{ steps.results.outputs.status }}\t${desc}" >> results.tsv
+
+      - name: Write job summary
+        if: always()
+        run: |
+          status="${{ steps.results.outputs.status }}"
+          if [ "$status" = "crash" ]; then
+            echo "## Experiment Result: CRASHED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Experiment Result: ${{ steps.results.outputs.val_bpb }} val_bpb" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| val_bpb | ${{ steps.results.outputs.val_bpb }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| memory_gb | ${{ steps.results.outputs.memory_gb }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| training_seconds | ${{ steps.results.outputs.training_seconds }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| num_params_M | ${{ steps.results.outputs.num_params_m }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| commit | ${{ steps.results.outputs.short_sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| description | ${{ inputs.description || github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$status" = "crash" ]; then
+            echo "### Last 50 lines of run.log" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 run.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload run log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: run-log-${{ steps.results.outputs.short_sha }}
+          path: run.log
+          retention-days: 30
+
+      - name: Upload results.tsv
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ steps.results.outputs.short_sha }}
+          path: results.tsv
+          retention-days: 90
